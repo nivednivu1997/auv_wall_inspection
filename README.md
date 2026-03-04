@@ -485,30 +485,6 @@ t = 7 s   sonar lifecycle → activate  → /wall_distance begins publishing
 t = 7 s+  PID controller and watchdog fully operational
 ```
 
-### UUV Simulator / Plankton (ROS 2 port)
-
-```bash
-# Launch underwater world
-ros2 launch plankton_gazebo_worlds empty_underwater_world.launch.py
-
-# Spawn vehicle
-ros2 launch plankton_descriptions upload_rexrov.launch.py
-
-# Launch controller stack (lifecycle transitions are automatic)
-ros2 launch distance_keep_controller distance_keep.launch.py
-```
-
-### Recording and playback
-
-```bash
-# Record all relevant topics
-ros2 bag record /wall_distance /cmd_vel /depth /emergency_cmd /emergency_active
-
-# Replay for offline analysis
-ros2 bag play <bag_directory>
-```
-
----
 
 ## Validation
 
