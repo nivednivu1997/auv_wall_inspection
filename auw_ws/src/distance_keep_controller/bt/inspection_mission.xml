@@ -1,0 +1,514 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+══════════════════════════════════════════════════════════════════════════════
+  AUV Inspection Mission — Behavior Tree
+  Framework : BehaviorTree.CPP v3  (used by Nav2)
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  MISSION PHASES                                                          │
+  │                                                                          │
+  │  0. Pre-Flight  — verify sonar alive, depth within limits                │
+  │  1. Search      — lawnmower waypoint pattern to locate target structure  │
+  │                   (spins 360° at each waypoint, checks sonar return)     │
+  │  2. Approach    — navigate to initial inspection standoff position       │
+  │  3. Inspect     — activate PID distance controller, traverse wall at    │
+  │                   2 m standoff while logging data                        │
+  │  4. Return      — navigate back to surface / home origin                 │
+  │                                                                          │
+  │  PARALLEL SAFETY LAYER  (ticks every BT cycle concurrently)             │
+  │  • Depth limit   : depth > max_depth → Emergency Surface                │
+  │  • Sonar health  : no message > 2 s  → Emergency Surface                │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  NODE LEGEND
+  ────────────────────────────────────────────────────────────────────────────
+  ★ = Standard Nav2 BT node (already available in nav2_behavior_tree)
+  ✦ = Custom BT node  (must be registered in the BT plugin library —
+      see bt_nodes/ plugin registration section in CMakeLists.txt)
+
+  Control nodes (no star — built into BT.CPP):
+    Sequence          : children run left→right; fails on first FAILURE
+    Fallback          : children run left→right; succeeds on first SUCCESS
+    ReactiveSequence  : re-ticks ALL children every cycle (not just first RUNNING)
+    ReactiveFallback  : same but fallback semantics
+    RecoveryNode★     : [main_child, recovery_child] — retries main N times
+    PipelineSequence★ : like Sequence but re-ticks running children
+
+  Decorators:
+    RetryUntilSuccessful★ : retry N times
+    RateController★       : throttle tick rate
+    Inverter              : flip SUCCESS/FAILURE
+
+  Blackboard Keys Used
+  ────────────────────────────────────────────────────────────────────────────
+    mission_phase        string  — PREFLIGHT|SEARCH|APPROACH|INSPECT|RETURN|COMPLETE
+    wall_detected        bool    — set true when sonar sees wall < detection_range
+    inspection_complete  bool    — set true after wall traverse finishes
+    search_waypoints     PoseArray — lawnmower search grid (loaded from parameter)
+    inspection_waypoints PoseArray — wall traversal path
+    approach_pose        PoseStamped
+    home_pose            PoseStamped
+══════════════════════════════════════════════════════════════════════════════
+-->
+
+<root main_tree_to_execute="AUVInspectionMission">
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!--   MAIN TREE                                                         -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <BehaviorTree ID="AUVInspectionMission">
+
+    <!--
+      RootWithSafety — ReactiveSequence
+      ══════════════════════════════════
+      A ReactiveSequence re-ticks ALL children on every BT cycle.
+      This means SafetyMonitor is evaluated on EVERY tick, even while
+      NavigateToPose is executing deep in the tree.
+
+      If SafetyMonitor returns FAILURE (emergency) the whole sequence
+      immediately returns FAILURE and the mission halts.
+    -->
+    <ReactiveSequence name="RootWithSafety">
+
+      <!-- ──────────────────────────────────────────────────────────────── -->
+      <!--  SAFETY LAYER  (evaluated every tick)                           -->
+      <!-- ──────────────────────────────────────────────────────────────── -->
+      <!--
+        ReactiveFallback: try first child (safety checks); if it FAILS,
+        try second child (emergency surface), then return FAILURE so the
+        parent ReactiveSequence also fails and the mission stops.
+      -->
+      <ReactiveFallback name="SafetyMonitor">
+
+        <!-- Both safety conditions must hold simultaneously -->
+        <ReactiveSequence name="SafetyConditions">
+
+          <!--
+            ✦ DepthWithinLimits
+            Subscribes to depth_topic and returns:
+              SUCCESS if current_depth ≤ max_depth
+              FAILURE if current_depth >  max_depth
+            Port: max_depth [double, metres, positive=deeper]
+            Port: depth_topic [string]
+          -->
+          <Condition ID="DepthWithinLimits"
+                     max_depth="10.0"
+                     depth_topic="/depth"/>
+
+          <!--
+            ✦ SonarHeartbeatOK
+            Returns SUCCESS if a message on /wall_distance was received
+            within the last timeout_sec seconds; FAILURE otherwise.
+            Port: timeout_sec [double]
+          -->
+          <Condition ID="SonarHeartbeatOK"
+                     timeout_sec="2.0"
+                     distance_topic="/wall_distance"/>
+
+        </ReactiveSequence>
+
+        <!--
+          ✦ EmergencySurface
+          Publishes geometry_msgs/Twist{linear.z=1.0} to emergency_topic
+          and Bool{true} to /emergency_active.
+          Always returns RUNNING so the parent ReactiveFallback keeps
+          re-ticking it (continuous upward thrust) until the node is halted.
+          Port: emergency_topic [string]
+        -->
+        <Action ID="EmergencySurface"
+                emergency_topic="/emergency_cmd"/>
+
+      </ReactiveFallback>
+      <!-- end SafetyMonitor -->
+
+
+      <!-- ──────────────────────────────────────────────────────────────── -->
+      <!--  MAIN MISSION SEQUENCE                                          -->
+      <!-- ──────────────────────────────────────────────────────────────── -->
+      <Sequence name="MissionSequence">
+
+
+        <!-- ╔══════════════════════════════════════════════════════════╗  -->
+        <!-- ║  PHASE 0 — PRE-FLIGHT CHECKS                            ║  -->
+        <!-- ╚══════════════════════════════════════════════════════════╝  -->
+        <Sequence name="PreFlightChecks">
+
+          <!-- Sonar must be publishing before we descend -->
+          <Condition ID="SonarHeartbeatOK"
+                     timeout_sec="2.0"
+                     distance_topic="/wall_distance"/>
+
+          <!-- Depth must be within limits at surface -->
+          <Condition ID="DepthWithinLimits"
+                     max_depth="10.0"
+                     depth_topic="/depth"/>
+
+          <!-- Initialise blackboard state variables -->
+          <!-- ★ SetBlackboard — sets a key/value on the blackboard -->
+          <Action ID="SetBlackboard"
+                  output_key="mission_phase"
+                  value="SEARCH"/>
+          <Action ID="SetBlackboard"
+                  output_key="wall_detected"
+                  value="false"/>
+          <Action ID="SetBlackboard"
+                  output_key="inspection_complete"
+                  value="false"/>
+
+        </Sequence>
+        <!-- end PreFlightChecks -->
+
+
+        <!-- ╔══════════════════════════════════════════════════════════╗  -->
+        <!-- ║  PHASE 1 — SEARCH                                        ║  -->
+        <!-- ║  Lawnmower waypoint pattern → spin → check sonar return  ║  -->
+        <!-- ╚══════════════════════════════════════════════════════════╝  -->
+        <!--
+          RecoveryNode★ — [main_child, recovery_child]
+          Executes main_child; if it returns FAILURE, executes recovery_child
+          then retries main_child, up to number_of_retries times.
+        -->
+        <RecoveryNode number_of_retries="3" name="SearchWithRecovery">
+
+          <!-- Main: navigate search pattern then confirm wall detected -->
+          <Sequence name="SearchPhase">
+
+            <Action ID="SetBlackboard"
+                    output_key="mission_phase"
+                    value="SEARCH"/>
+
+            <!--
+              ★ NavigateThroughPoses
+              Sends the vehicle through an ordered list of waypoints.
+              Port: poses      — PoseArray from blackboard key {search_waypoints}
+              Port: server_name — action server name
+              Port: server_timeout — ms to wait for server
+              The search_waypoints key is pre-populated (e.g. lawnmower grid
+              generated by the mission planner before BT execution).
+            -->
+            <Action ID="NavigateThroughPoses"
+                    poses="{search_waypoints}"
+                    server_name="navigate_through_poses"
+                    server_timeout="300000"
+                    behavior_tree=""/>
+
+            <!--
+              At the final search waypoint: spin a full circle and check
+              whether the sonar sees a wall closer than detection_range.
+            -->
+            <Sequence name="ScanAndConfirm">
+
+              <!--
+                ★ Spin
+                Rotates the vehicle in place by spin_dist radians.
+                spin_dist = 6.28 ≈ full 360° turn.
+              -->
+              <Action ID="Spin"
+                      spin_dist="6.28318"
+                      time_allowance="30.0"/>
+
+              <!--
+                ✦ WallDetected
+                Returns SUCCESS if /wall_distance reading < max_detection_range.
+                Also writes true → blackboard key "wall_detected".
+                Port: max_detection_range [double, metres]
+                Port: distance_topic [string]
+                Port: output_key [string] — blackboard key to set
+              -->
+              <Condition ID="WallDetected"
+                         max_detection_range="5.0"
+                         distance_topic="/wall_distance"
+                         output_key="wall_detected"/>
+
+            </Sequence>
+            <!-- end ScanAndConfirm -->
+
+          </Sequence>
+          <!-- end SearchPhase (main) -->
+
+          <!-- Recovery: back up, clear costmap, then retry search -->
+          <Sequence name="SearchRecovery">
+
+            <!--
+              ★ BackUp — drives the vehicle backward
+              backup_dist  : distance [m]
+              backup_speed : speed [m/s]
+              time_allowance : max time before FAILURE [s]
+            -->
+            <Action ID="BackUp"
+                    backup_dist="1.0"
+                    backup_speed="0.1"
+                    time_allowance="10.0"/>
+
+            <!--
+              ★ ClearEntireCostmap — wipes stale obstacles from the planner
+            -->
+            <Action ID="ClearEntireCostmap"
+                    server_name="global_costmap/clear_entirely_global_costmap"
+                    server_timeout="3000"/>
+
+          </Sequence>
+          <!-- end SearchRecovery -->
+
+        </RecoveryNode>
+        <!-- end SearchWithRecovery -->
+
+
+        <!-- ╔══════════════════════════════════════════════════════════╗  -->
+        <!-- ║  PHASE 2 — APPROACH                                      ║  -->
+        <!-- ║  Navigate to standoff position in front of the wall      ║  -->
+        <!-- ╚══════════════════════════════════════════════════════════╝  -->
+        <Sequence name="ApproachPhase">
+
+          <Action ID="SetBlackboard"
+                  output_key="mission_phase"
+                  value="APPROACH"/>
+
+          <!--
+            ★ NavigateToPose
+            Navigates to a single goal pose stored on the blackboard.
+            approach_pose is computed by the mission planner as:
+              position = (wall_position) − (2.0 m in wall-normal direction)
+            Port: goal — PoseStamped from blackboard {approach_pose}
+          -->
+          <Action ID="NavigateToPose"
+                  goal="{approach_pose}"
+                  server_name="navigate_to_pose"
+                  server_timeout="120000"
+                  behavior_tree=""/>
+
+          <!--
+            ★ Wait — dwell at approach position to let PID controller settle
+            The DistanceKeepController integrator needs a few cycles to
+            converge from the approach transient.
+          -->
+          <Action ID="Wait" wait_duration="3.0"/>
+
+          <!--
+            ✦ DistanceAtSetpoint
+            Returns SUCCESS if |current_distance − setpoint| ≤ tolerance.
+            Ensures the vehicle has actually settled at 2 m before inspection.
+            Port: setpoint  [double, metres]
+            Port: tolerance [double, metres]
+            Port: distance_topic [string]
+          -->
+          <Condition ID="DistanceAtSetpoint"
+                     setpoint="2.0"
+                     tolerance="0.30"
+                     distance_topic="/wall_distance"/>
+
+        </Sequence>
+        <!-- end ApproachPhase -->
+
+
+        <!-- ╔══════════════════════════════════════════════════════════╗  -->
+        <!-- ║  PHASE 3 — INSPECT                                       ║  -->
+        <!-- ║  PID distance controller active; traverse wall at 2 m   ║  -->
+        <!-- ╚══════════════════════════════════════════════════════════╝  -->
+        <RecoveryNode number_of_retries="2" name="InspectionWithRecovery">
+
+          <!-- Main inspection sequence -->
+          <Sequence name="InspectionPhase">
+
+            <Action ID="SetBlackboard"
+                    output_key="mission_phase"
+                    value="INSPECT"/>
+
+            <!--
+              ✦ ActivateDistanceController
+              Sends a lifecycle service call or parameter update to ensure
+              the DistanceKeepController is publishing /cmd_vel.
+              Also sets the PID setpoint via ROS 2 parameter service.
+              Port: setpoint       [double, metres]
+              Port: controller_node [string — node name]
+            -->
+            <Action ID="ActivateDistanceController"
+                    setpoint="2.0"
+                    controller_node="/distance_keep_controller"/>
+
+            <!--
+              ★ NavigateThroughPoses — traverse inspection waypoints.
+              While the surge/yaw axes are controlled by Nav2 path following,
+              the lateral (wall-normal) axis is simultaneously controlled by
+              the PID DistanceKeepController publishing /cmd_vel.linear.y.
+              inspection_waypoints are parallel to the wall at ~2 m standoff.
+            -->
+            <Action ID="NavigateThroughPoses"
+                    poses="{inspection_waypoints}"
+                    server_name="navigate_through_poses"
+                    server_timeout="600000"
+                    behavior_tree=""/>
+
+            <!--
+              ✦ DeactivateDistanceController
+              Stops the PID controller from publishing /cmd_vel (sets output=0).
+            -->
+            <Action ID="DeactivateDistanceController"
+                    controller_node="/distance_keep_controller"/>
+
+            <Action ID="SetBlackboard"
+                    output_key="inspection_complete"
+                    value="true"/>
+
+          </Sequence>
+          <!-- end InspectionPhase (main) -->
+
+          <!-- Recovery: hover in place, re-acquire wall, retry -->
+          <Sequence name="InspectionRecovery">
+
+            <!-- Stop lateral controller before recovery manoeuvre -->
+            <Action ID="DeactivateDistanceController"
+                    controller_node="/distance_keep_controller"/>
+
+            <!-- Hover in place for 5 s, let currents settle -->
+            <Action ID="Wait" wait_duration="5.0"/>
+
+            <!-- Re-confirm wall is still visible before retrying -->
+            <Condition ID="WallDetected"
+                       max_detection_range="5.0"
+                       distance_topic="/wall_distance"
+                       output_key="wall_detected"/>
+
+          </Sequence>
+          <!-- end InspectionRecovery -->
+
+        </RecoveryNode>
+        <!-- end InspectionWithRecovery -->
+
+
+        <!-- ╔══════════════════════════════════════════════════════════╗  -->
+        <!-- ║  PHASE 4 — RETURN TO SURFACE / HOME                     ║  -->
+        <!-- ╚══════════════════════════════════════════════════════════╝  -->
+        <Sequence name="ReturnPhase">
+
+          <Action ID="SetBlackboard"
+                  output_key="mission_phase"
+                  value="RETURN"/>
+
+          <!--
+            ★ NavigateToPose — return to home/surface origin.
+            home_pose is typically the dive entry point at depth=0.
+          -->
+          <Action ID="NavigateToPose"
+                  goal="{home_pose}"
+                  server_name="navigate_to_pose"
+                  server_timeout="180000"
+                  behavior_tree=""/>
+
+          <Action ID="SetBlackboard"
+                  output_key="mission_phase"
+                  value="COMPLETE"/>
+
+        </Sequence>
+        <!-- end ReturnPhase -->
+
+      </Sequence>
+      <!-- end MissionSequence -->
+
+    </ReactiveSequence>
+    <!-- end RootWithSafety -->
+
+  </BehaviorTree>
+  <!-- end AUVInspectionMission -->
+
+
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!--   CUSTOM BT NODES — REGISTRATION SIGNATURES                        -->
+  <!--   (Implement these in bt_nodes/ and register via BT plugin macro)  -->
+  <!-- ════════════════════════════════════════════════════════════════════ -->
+  <!--
+    The TreeNodesModel section is optional but enables the Groot visualiser
+    to show correct port information for custom nodes.
+  -->
+  <TreeNodesModel>
+
+    <!-- ── Conditions ───────────────────────────────────────────────── -->
+    <Condition ID="DepthWithinLimits">
+      <input_port name="max_depth"    default="10.0">Max allowed depth [m]</input_port>
+      <input_port name="depth_topic"  default="/depth">ROS topic name</input_port>
+    </Condition>
+
+    <Condition ID="SonarHeartbeatOK">
+      <input_port name="timeout_sec"      default="2.0">Silence threshold [s]</input_port>
+      <input_port name="distance_topic"   default="/wall_distance">ROS topic</input_port>
+    </Condition>
+
+    <Condition ID="WallDetected">
+      <input_port  name="max_detection_range" default="5.0">Sonar range [m]</input_port>
+      <input_port  name="distance_topic"      default="/wall_distance"/>
+      <output_port name="output_key"          default="wall_detected">Blackboard key</output_port>
+    </Condition>
+
+    <Condition ID="DistanceAtSetpoint">
+      <input_port name="setpoint"       default="2.0">Desired distance [m]</input_port>
+      <input_port name="tolerance"      default="0.3">Acceptable error [m]</input_port>
+      <input_port name="distance_topic" default="/wall_distance"/>
+    </Condition>
+
+    <!-- ── Actions ──────────────────────────────────────────────────── -->
+    <Action ID="EmergencySurface">
+      <input_port name="emergency_topic" default="/emergency_cmd">Twist topic</input_port>
+    </Action>
+
+    <Action ID="ActivateDistanceController">
+      <input_port name="setpoint"        default="2.0">PID setpoint [m]</input_port>
+      <input_port name="controller_node" default="/distance_keep_controller"/>
+    </Action>
+
+    <Action ID="DeactivateDistanceController">
+      <input_port name="controller_node" default="/distance_keep_controller"/>
+    </Action>
+
+  </TreeNodesModel>
+
+</root>
+
+<!--
+══════════════════════════════════════════════════════════════════════════════
+  EXECUTION FLOW DIAGRAM
+
+  RootWithSafety (ReactiveSequence)
+  ├── SafetyMonitor (ReactiveFallback)         ← ticked EVERY cycle
+  │   ├── SafetyConditions (ReactiveSequence)
+  │   │   ├── [C] DepthWithinLimits            ← depth > 10m? → FAILURE
+  │   │   └── [C] SonarHeartbeatOK             ← silence > 2s? → FAILURE
+  │   └── [A] EmergencySurface                 ← fires on any safety FAILURE
+  │
+  └── MissionSequence (Sequence)
+      ├── PreFlightChecks (Sequence)
+      │   ├── [C] SonarHeartbeatOK
+      │   ├── [C] DepthWithinLimits
+      │   └── [A] SetBlackboard ×3
+      │
+      ├── SearchWithRecovery (RecoveryNode, retries=3)
+      │   ├── SearchPhase (Sequence)            ← MAIN
+      │   │   ├── [A] NavigateThroughPoses      ← lawnmower waypoints
+      │   │   └── ScanAndConfirm (Sequence)
+      │   │       ├── [A] Spin 360°
+      │   │       └── [C] WallDetected
+      │   └── SearchRecovery (Sequence)         ← RECOVERY
+      │       ├── [A] BackUp
+      │       └── [A] ClearEntireCostmap
+      │
+      ├── ApproachPhase (Sequence)
+      │   ├── [A] NavigateToPose                ← go to approach_pose
+      │   ├── [A] Wait 3 s
+      │   └── [C] DistanceAtSetpoint ±0.3 m
+      │
+      ├── InspectionWithRecovery (RecoveryNode, retries=2)
+      │   ├── InspectionPhase (Sequence)        ← MAIN
+      │   │   ├── [A] ActivateDistanceController
+      │   │   ├── [A] NavigateThroughPoses      ← wall traverse waypoints
+      │   │   ├── [A] DeactivateDistanceController
+      │   │   └── [A] SetBlackboard (inspection_complete=true)
+      │   └── InspectionRecovery (Sequence)     ← RECOVERY
+      │       ├── [A] DeactivateDistanceController
+      │       ├── [A] Wait 5 s
+      │       └── [C] WallDetected
+      │
+      └── ReturnPhase (Sequence)
+          ├── [A] NavigateToPose                ← go to home_pose
+          └── [A] SetBlackboard (COMPLETE)
+
+══════════════════════════════════════════════════════════════════════════════
+-->
