@@ -473,7 +473,6 @@ The Gazebo launch sets up:
 - An **underwater world** with a vertical concrete inspection wall at Y = 4 m
 - A minimal **AUV model** (cylinder body) with a forward-facing ray-sensor sonar plugin
 - The sonar plugin bridges to `/wall_distance` via `libgazebo_ros_ray_sensor.so`
-- `rqt_plot` opens automatically showing `/wall_distance`, `/cmd_vel/linear/y`, `/depth`
 
 **Timeline after launch:**
 
